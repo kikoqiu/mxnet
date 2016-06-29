@@ -58,6 +58,124 @@ struct ConvolutionParam : public dmlc::Parameter<ConvolutionParam> {
     .describe("Whether to disable bias parameter.");
   }
 };
+#if !defined(__CUDACC__)
+
+inline bool is_a_ge_zero_and_a_lt_b(index_t a, index_t b) {
+    return static_cast<unsigned>(a) < static_cast<unsigned>(b);
+}
+
+template<typename Dtype>
+inline void im2col_cpu(const Dtype* data_im, const index_t n_samples, const index_t channels,
+    const index_t height, const index_t width, const index_t kernel_h,
+    const index_t kernel_w, const index_t pad_h, const index_t pad_w,
+    const index_t stride_h, const index_t stride_w,
+    const index_t dilation_h, const index_t dilation_w,
+    Dtype* data_col) {
+    const index_t output_h = (height + 2 * pad_h
+        - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
+    const index_t output_w =
+        (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
+
+    const index_t channel_size = height * width;
+
+    /*
+    channel*y_offset*x_offset,
+    n_sample*y*x
+    */
+#pragma omp parallel for
+    for (int channel = 0;channel< channels; ++channel) {
+        auto data_im_c = data_im + channel*channel_size;
+        auto data_col_c = data_col + channel * kernel_h*kernel_w*n_samples*output_h*output_w;
+        for (index_t kernel_row = 0; kernel_row < kernel_h; kernel_row++) {
+            for (index_t kernel_col = 0; kernel_col < kernel_w; kernel_col++) {
+                for (index_t n_sample = 0; n_sample < n_samples; ++n_sample){
+                    auto data_im_s = data_im_c + n_sample*(channel_size*channels);
+                    index_t input_row = -pad_h + kernel_row * dilation_h;
+                    for (index_t output_rows = output_h; output_rows; output_rows--) {
+                        if (!is_a_ge_zero_and_a_lt_b(input_row, height)) {
+                            for (index_t output_cols = output_w; output_cols; output_cols--) {
+                                *(data_col_c++) = 0;
+                            }
+                        }
+                        else {
+                            index_t input_col = -pad_w + kernel_col * dilation_w;
+                            for (index_t output_col = output_w; output_col; output_col--) {
+                                if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
+                                    *(data_col_c++) = data_im_s[input_row * width + input_col];
+                                }
+                                else {
+                                    *(data_col_c++) = 0;
+                                }
+                                input_col += stride_w;
+                            }
+                        }
+                        input_row += stride_h;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+template<typename Dtype>
+inline void col2im_cpu(Dtype* data_im, const index_t n_samples, const index_t channels,
+    const index_t height, const index_t width, const index_t kernel_h,
+    const index_t kernel_w, const index_t pad_h, const index_t pad_w,
+    const index_t stride_h, const index_t stride_w,
+    const index_t dilation_h, const index_t dilation_w,
+    const Dtype* data_col, OpReqType req) {
+    const index_t output_h = (height + 2 * pad_h
+        - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
+    const index_t output_w =
+        (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
+
+    const index_t channel_size = height * width;
+
+    switch (req){
+        case OpReqType::kNullOp:
+            return;
+        case OpReqType::kWriteTo:
+        case OpReqType::kWriteInplace:
+            memset(data_im, 0, n_samples*channels*channel_size*sizeof(Dtype));
+            break;
+        case OpReqType::kAddTo:
+            break;
+        default:
+            LOG(FATAL) << "not reached";
+    }
+#pragma omp parallel for
+    for (int channel = 0; channel< channels; ++channel) {
+        auto data_im_c = data_im + channel*channel_size;
+        auto data_col_c = data_col + channel * kernel_h*kernel_w*n_samples*output_h*output_w;
+        for (index_t kernel_row = 0; kernel_row < kernel_h; kernel_row++) {
+            for (index_t kernel_col = 0; kernel_col < kernel_w; kernel_col++) {
+                for (index_t n_sample = 0; n_sample < n_samples; ++n_sample){
+                    auto data_im_s = data_im_c + n_sample*(channel_size*channels);
+                    index_t input_row = -pad_h + kernel_row * dilation_h;
+                    for (index_t output_rows = output_h; output_rows; output_rows--) {
+                        if (!is_a_ge_zero_and_a_lt_b(input_row, height)) {
+                            data_col += output_w;
+                        }
+                        else {
+                            index_t input_col = -pad_w + kernel_col * dilation_w;
+                            for (index_t output_col = output_w; output_col; output_col--) {
+                                if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
+                                    data_im_s[input_row * width + input_col] += *data_col_c;
+                                }
+                                data_col_c++;
+                                input_col += stride_w;
+                            }
+                        }
+                        input_row += stride_h;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif
 
 template<typename xpu, typename DType>
 class ConvolutionOp : public Operator {
@@ -106,6 +224,7 @@ class ConvolutionOp : public Operator {
                                                Shape3(shape_dstunit_[0],
                                                       shape_dstunit_[1],
                                                       shape_dstunit_[2] * step), s);
+#if defined(__CUDACC__)
       if (param_.pad[0] == 0 && param_.pad[1] == 0) {
         temp_col = unpack_patch2col(data.Slice(i, i + step),
                                     param_.kernel[0],
@@ -124,6 +243,22 @@ class ConvolutionOp : public Operator {
                                     param_.dilate[0],
                                     param_.dilate[1]);
       }
+#else
+        im2col_cpu(data.Slice(i, i + step).dptr_,
+            step,
+            data.size(1),
+            data.size(2),
+            data.size(3),
+            param_.kernel[0],
+            param_.kernel[1],
+            param_.pad[0],
+            param_.pad[1],
+            param_.stride[0],
+            param_.stride[1],
+            param_.dilate[0],
+            param_.dilate[1],
+            temp_col.dptr_);
+#endif
 
       const index_t gstride = temp_col.size(0) / param_.num_group;
       for (uint32_t gid = 0; gid < param_.num_group; ++gid) {
@@ -191,6 +326,7 @@ class ConvolutionOp : public Operator {
                                                       shape_dstunit_[1],
                                                       shape_dstunit_[2] * step), s);
       temp_dst = reshape(swapaxis<1, 0>(grad.Slice(i, i + step)), temp_dst.shape_);
+#if defined(__CUDACC__)
       if (param_.pad[0] == 0 && param_.pad[1] == 0) {
         temp_col = unpack_patch2col(data.Slice(i, i + step),
                                      param_.kernel[0],
@@ -208,6 +344,22 @@ class ConvolutionOp : public Operator {
                                      param_.dilate[0],
                                      param_.dilate[1]);
       }
+#else
+          im2col_cpu(data.Slice(i, i + step).dptr_,
+              step,
+              data.size(1),
+              data.size(2),
+              data.size(3),
+              param_.kernel[0],
+              param_.kernel[1],
+              param_.pad[0],
+              param_.pad[1],
+              param_.stride[0],
+              param_.stride[1],
+              param_.dilate[0],
+              param_.dilate[1],
+              temp_col.dptr_);
+#endif
       const index_t gstride = temp_col.size(0) / param_.num_group;
       for (uint32_t gid = 0; gid < param_.num_group; ++gid) {
         Tensor<xpu, 2, DType> tmpc = temp_col.Slice(gstride * gid, gstride * (gid + 1));
@@ -223,6 +375,7 @@ class ConvolutionOp : public Operator {
         Tensor<xpu, 2, DType> tmpc = temp_col.Slice(gstride * gid, gstride * (gid + 1));
         tmpc = dot(wmat[gid].T(), temp_dst[gid]);
       }
+#if defined(__CUDACC__)
       if (param_.pad[0] == 0 && param_.pad[1] == 0) {
         Assign(gdata.Slice(i, i + step), req[conv::kData],
                pack_col2patch(temp_col,
@@ -244,6 +397,22 @@ class ConvolutionOp : public Operator {
                                    param_.dilate[0]),
                     gdata[i][0].shape_));
       }
+#else
+      col2im_cpu(data.Slice(i, i + step).dptr_,
+          step,
+          data.size(1),
+          data.size(2),
+          data.size(3),
+          param_.kernel[0],
+          param_.kernel[1],
+          param_.pad[0],
+          param_.pad[1],
+          param_.stride[0],
+          param_.stride[1],
+          param_.dilate[0],
+          param_.dilate[1],
+          temp_col.dptr_,req[conv::kData]);
+#endif
     }
     if (!param_.no_bias) {
       Tensor<xpu, 1, DType> gbias = in_grad[conv::kBias].get<xpu, 1, DType>(s);
